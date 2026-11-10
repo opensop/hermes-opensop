@@ -45,7 +45,7 @@
     {
       "id": "approve",
       "type": "approval",
-      "description": "A person reviews the diff and approves or rejects it."
+      "description": "A person reviews the change (git diff {{ setup.base }}) and approves or rejects it."
     },
     {
       "id": "decision",

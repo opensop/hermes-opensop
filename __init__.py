@@ -120,8 +120,11 @@ def _view(st):
             v["next"] = "Do the work for this step, then call sop_submit with its outputs."
     if st.get("error"):
         v["error"] = st["error"]
-        v["next"] = "Fix the cause, then call sop_retry to re-run the failed step."
+        v["next"] = ("Fix the cause, then call sop_retry to re-run the failed step. If the cause is the "
+                     "user's setup (their repo, their uncommitted work), ask the user instead.")
     elif st.get("state") == "interrupted":
+        if st.get("interrupted"):
+            v["interrupted"] = st["interrupted"]
         v["next"] = "The run stopped mid-step. Call sop_retry to re-run that step."
     return v
 
@@ -156,15 +159,19 @@ def _session_cwd():
         return ""
 
 
+def _path(p):
+    return os.path.expanduser(p) if isinstance(p, str) and p else p
+
+
 def _workdir(args):
-    return args.get("workdir") or _session_cwd() or os.environ.get("TERMINAL_CWD") or os.getcwd()
+    return _path(args.get("workdir")) or _session_cwd() or os.environ.get("TERMINAL_CWD") or os.getcwd()
 
 
 def _resolve(args, kwargs):
     """(run_id, cwd) from args, falling back to this session's bound run."""
     b = _bound(kwargs.get("session_id")) or {}
     run_id = args.get("run_id") or b.get("run_id")
-    cwd = args.get("workdir") or (b.get("cwd") if b.get("run_id") == run_id else None) or _workdir(args)
+    cwd = _path(args.get("workdir")) or (b.get("cwd") if b.get("run_id") == run_id else None) or _workdir(args)
     return run_id, cwd
 
 
@@ -173,8 +180,9 @@ def _after(run_id, cwd, session_id):
     st, err = _status(run_id, cwd)
     if err:
         if "no such local run" in err:
-            err += (f" Runs are stored per project (OpenSOP cell); this looked in {cwd}. "
-                    "Pass workdir= the directory the run was started from.")
+            err += (" Runs live in OPENSOP_LOCAL_HOME, the nearest .opensop/ folder above the working "
+                    f"directory ({cwd}), or ~/.opensop-local. If the run was started in another project, "
+                    "pass workdir= that project's directory.")
         return tool_error(err, run_id=run_id)
     if st.get("state") in OPEN_STATES:
         _bind(session_id, run_id, cwd, st.get("run_dir"))
@@ -186,11 +194,14 @@ def _after(run_id, cwd, session_id):
 # ── tools ────────────────────────────────────────────────────────────────────
 
 def sop_run(args, **kwargs):
-    process = (args.get("process") or "").strip()
+    process = _path((args.get("process") or "").strip())
     if not process:
         return tool_error("process is required: a path to a .sop.json/.sop.yaml file or a process name")
+    inputs = args.get("inputs") or {}
+    if not isinstance(inputs, dict):
+        return tool_error('inputs must be a JSON object, like {"request": "..."}')
     cwd = _workdir(args)
-    with _json_file(args.get("inputs") or {}) as path:
+    with _json_file(inputs) as path:
         out, err = _opensop(["run", process, "--inputs-file", path], cwd)
     if err:
         return tool_error(err)
@@ -226,11 +237,14 @@ def sop_submit(args, **kwargs):
     if w.get("reason") in HUMAN_REASONS:
         return tool_error(f"Step '{w.get('step')}' is decided by a person, not the agent. "
                           "Ask the user to run: opensop submit " + run_id + " " + str(w.get("step")) +
-                          " --output decision=...", run_id=run_id)
+                          " --output decision=... --decided-by person:$USER", run_id=run_id)
     if w.get("reason") == "waiting_for_callback":
         return tool_error(f"Step '{w.get('step')}' waits on an outside callback or timer, not on the agent.",
                           run_id=run_id)
-    with _json_file(args.get("outputs") or {}) as path:
+    outputs = args.get("outputs") or {}
+    if not isinstance(outputs, dict):
+        return tool_error('outputs must be a JSON object, like {"summary": "..."}', run_id=run_id)
+    with _json_file(outputs) as path:
         _, err = _opensop(["submit", run_id, step, "--outputs-file", path, "--decided-by", DECIDED_BY], cwd)
     if err:
         return tool_error(err, run_id=run_id)
@@ -319,7 +333,8 @@ def _pre_llm_call(session_id=None, **kwargs):
     if not v:
         return None
     if v.get("error"):
-        v["error"] = {**v["error"], "message": str(v["error"].get("message") or "")[-600:]}
+        m = str(v["error"].get("message") or "")
+        v["error"] = {**v["error"], "message": m if len(m) <= 600 else m[:300] + " … " + m[-300:]}
     text = ("[OpenSOP] This session is working on run " + str(v["run_id"]) + " (" + str(v["process"]) +
             "), state " + str(v["state"]) + ". " + json.dumps({k: v[k] for k in ("waiting", "error", "next") if k in v}))
     return {"context": text[:MAX_CONTEXT_CHARS]}
@@ -370,19 +385,26 @@ def _pre_tool_call(tool_name=None, args=None, session_id=None, **kwargs):
         return None
     if tool_name == "sop_run":
         # Script steps run as shell commands outside Hermes's terminal approvals: ask once per run.
-        # The process definition is pinned when the run starts.
+        # The message names the inputs and the file's hash; Hermes keys "always"/"session" on it,
+        # so a new input or a changed process file asks again.
+        process = _path(str(args.get("process") or ""))
+        try:
+            with open(os.path.join(_workdir(args), process), "rb") as f:
+                digest = " (sha256 " + hashlib.sha256(f.read()).hexdigest()[:12] + ")"
+        except OSError:
+            digest = ""
         return {"action": "approve",
-                "message": f"OpenSOP will run the script steps of {args.get('process')} in "
-                           f"{_workdir(args)} with your permissions."}
+                "message": f"OpenSOP will run the script steps of {process}{digest} in {_workdir(args)} "
+                           f"with your permissions, with inputs {json.dumps(args.get('inputs') or {})[:800]}."}
     if tool_name in TOOL_NAMES:
         return None
     bound = _bound(session_id) or {}
     text = json.dumps(args)
     # The run folder is the record. Nothing the agent does should rewrite it.
-    in_runs = "runs/" in text or ".opensop" in text or ".opensop-local" in text
+    in_runs = ".opensop" in text  # .opensop/ cells and ~/.opensop-local
     if bound.get("run_dir") and (bound["run_dir"] in text or (in_runs and any(f in text for f in RUN_FILES))):
-        return _block(f"run {bound['run_id']}'s run folder is its record; the agent doesn't edit it. "
-                      "Use the sop_* tools.")
+        return _block(f"run {bound['run_id']}'s run folder is its record; the agent works through the "
+                      "sop_* tools instead (sop_status shows the run).")
     command = str(args.get("command") or "") if tool_name == "terminal" else ""
     m = _SUBMIT.search(command)
     if not m:

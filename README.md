@@ -1,5 +1,7 @@
 # OpenSOP for Hermes
 
+[![CI](https://github.com/opensop/hermes-opensop/actions/workflows/ci.yml/badge.svg)](https://github.com/opensop/hermes-opensop/actions/workflows/ci.yml)
+
 **Turn your best agent workflow into a file anyone can run.**
 
 Every process sits somewhere between a script and a judgment call. Some steps must always come out the same: run the tests, check the diff, merge only when the build is green. Others need a model: plan the work, write the change, decide what a failure means.
@@ -22,7 +24,7 @@ Every process sits somewhere between a script and a judgment call. Some steps mu
 | Re-anchoring (`pre_llm_call`) | Every turn, the agent sees which run it is on and the step it owes. This survives compaction (`post_compaction`). |
 | Finish gate (`pre_verify`) | On a turn where it edited code, the agent is nudged once to finish its open step, or say what blocks it, before wrapping up. |
 | Human steps stay human (`pre_tool_call`) | Approval steps and escalated judgments are for a person. `sop_submit` refuses them, an `opensop submit` for them in the terminal is blocked, and so are edits to the run's own folder. Everything the agent submits is recorded as `decided_by: agent:hermes`. |
-| One approval per run (`pre_tool_call`) | `sop_run` goes through Hermes's approval prompt, because the run's script steps execute outside Hermes's terminal approvals. |
+| Approval before a run (`pre_tool_call`) | `sop_run` goes through Hermes's approval prompt, because the run's script steps execute outside Hermes's terminal approvals. The prompt names the process file (with its hash) and the inputs; a different input or a changed file asks again. |
 
 ## Install
 
@@ -47,21 +49,22 @@ The plugin ships one example, [`examples/change-with-tests.sop.json`](examples/c
 
 Here the test command is an input, to keep the example general. In your own processes, put the command that defines "done" in the file, so the agent can't choose an easier one.
 
-In a git checkout, ask Hermes:
+In a git checkout with no uncommitted changes (the setup step refuses a dirty tree), ask Hermes:
 
 > Use the OpenSOP process at `~/.hermes/plugins/opensop/examples/change-with-tests.sop.json` to fix the failing test. The test command is `npm test`.
 
 Then try the part a prompt can't do: quit Hermes mid-run, and finish from anywhere.
 
 ```bash
+opensop runs                     # find the run id
 opensop status <run_id>          # where the run stands, and the exact next command
-opensop submit <run_id> approve --output decision=approve
+opensop submit <run_id> approve --output decision=approve --decided-by person:$USER
 opensop heal <run_id> --apply     # after fixing a failed step: re-run it and continue
 ```
 
 Script steps always run in the project the run was started in, wherever you type these.
 
-Or start a fresh Hermes session in the same project and say "continue OpenSOP run `<run_id>`". Runs are stored per project, so from another directory, also give the project path.
+Or start a fresh Hermes session and say "continue OpenSOP run `<run_id>`". Runs are kept in `~/.opensop-local` unless the project has its own `.opensop/` folder (`opensop init`); in that case, start Hermes in that project or give it the project path.
 
 ## Write your own
 
@@ -81,6 +84,7 @@ A process is a JSON or YAML file. Each step is a script (`automated`), work for 
 - The re-anchoring and finish gate follow one run per session. Start a second run and the session follows that one. While a run waits on a person, the session keeps showing it; `sop_status` with `detach: true` stops following it.
 - The finish gate fires only on turns where Hermes edited code (that is when Hermes runs `pre_verify`).
 - The human-step guards are seat belts, not a sandbox. They catch `sop_submit`, `opensop submit …` in the terminal and edits that name the run's folder or files. An agent with a shell can still get around them, for example by scripting the CLI another way. For a hard boundary, decide approval steps from a separate account or machine. Steps submitted through the plugin are marked `decided_by: agent:hermes` in the receipts.
+- The process file is pinned when the run starts; the scripts it calls are not. An agent that rewrites a step's script can change what that step checks. Each script step's receipt records the script's `script_sha256`, so a changed script shows up in the audit. Keep process scripts where the agent doesn't work, or under review.
 - Re-anchoring adds the current step to each user turn, so long sessions carry a snapshot per turn in their history.
 
 ## Develop
