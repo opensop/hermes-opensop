@@ -1,0 +1,44 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: hermes ${{ matrix.hermes }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        hermes: [v0.23.0, v0.23.1]
+    env:
+      HERMES_DISABLE_LAZY_INSTALLS: "1"
+      OPENSOP_REF: v0.10.0
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: "3.14"
+      - name: Install opensop ${{ env.OPENSOP_REF }}
+        run: |
+          sudo apt-get install -y jq
+          git clone --depth 1 --branch "$OPENSOP_REF" https://github.com/opensop/opensop.git "$RUNNER_TEMP/opensop"
+          echo "$RUNNER_TEMP/opensop/cli/bin" >> "$GITHUB_PATH"
+      - name: Install Hermes ${{ matrix.hermes }}
+        run: |
+          git clone --filter=blob:none https://github.com/NousResearch/hermes-agent.git "$RUNNER_TEMP/hermes-agent"
+          git -C "$RUNNER_TEMP/hermes-agent" checkout --detach "${{ matrix.hermes }}"
+          python -m pip install uv
+          uv sync --locked --python 3.14 --project "$RUNNER_TEMP/hermes-agent"
+          uv pip install --python "$RUNNER_TEMP/hermes-agent/.venv/bin/python" pytest
+          echo "$RUNNER_TEMP/hermes-agent/.venv/bin" >> "$GITHUB_PATH"
+          echo "HERMES_SRC=$RUNNER_TEMP/hermes-agent" >> "$GITHUB_ENV"
+      - run: opensop --version
+      - run: pytest -q -rs
+      - run: hermes plugins validate .
+      - run: hermes plugins doctor . --ci

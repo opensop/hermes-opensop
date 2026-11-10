@@ -1,0 +1,21 @@
+name: opensop
+version: "0.1.0"
+description: "Run OpenSOP process files from Hermes. Scripts decide done; the agent does the steps that need judgment; every step leaves a receipt."
+author: opensop
+manifest_version: 2
+api_version: 1
+license: Apache-2.0
+homepage: https://github.com/opensop/hermes-opensop
+requires_hermes: ">=0.23.0"
+kind: standalone
+tags: [process, workflow, receipts, multi-agent, coding]
+provides_tools:
+  - sop_run
+  - sop_status
+  - sop_submit
+  - sop_retry
+provides_hooks:
+  - pre_llm_call
+  - pre_verify
+  - pre_tool_call
+  - post_compaction

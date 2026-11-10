@@ -1,0 +1,21 @@
+{
+  "opensop": "0.9.1",
+  "name": "change-with-tests",
+  "version": "1.0.0",
+  "description": "An agent makes a code change; a script runs the tests; a person approves the diff.",
+  "inputs": [
+    {"name": "request", "type": "string", "required": true, "description": "The change to make"},
+    {"name": "test_command", "type": "string", "required": true, "description": "Command that must pass, e.g. npm test"}
+  ],
+  "steps": [
+    {"id": "setup", "type": "automated", "run": "steps/setup.sh",
+     "description": "Record the starting commit and refuse a dirty tree."},
+    {"id": "change", "type": "form",
+     "description": "Make this change in the working tree, without committing: {{ request }}. Then submit a one-line summary.",
+     "outputs": [{"name": "summary", "type": "string", "required": true}]},
+    {"id": "tests", "type": "automated", "run": "steps/tests.sh",
+     "description": "Run the test command. The run fails here until it passes."},
+    {"id": "approve", "type": "approval",
+     "description": "A person reviews the diff and approves or rejects it."}
+  ]
+}
