@@ -28,7 +28,7 @@ Every process sits somewhere between a script and a judgment call. Some steps mu
 Requirements: Hermes Agent 0.23.0 or later, and the `opensop` CLI 0.10.0 or later on `PATH`:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/opensop/opensop/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/opensop/opensop/main/cli/install.sh | bash
 hermes plugins install https://github.com/opensop/hermes-opensop
 hermes plugins enable opensop
 ```
