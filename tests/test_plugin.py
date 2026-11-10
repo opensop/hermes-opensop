@@ -189,3 +189,28 @@ def test_session_keys_do_not_collide_and_compaction_moves_the_binding(env):
     ctx.hooks["post_compaction"](session_id="s1b", old_session_id="s1")
     assert ctx.hooks["pre_llm_call"](session_id="s1") is None
     assert run_id in ctx.hooks["pre_llm_call"](session_id="s1b")["context"]
+
+
+def test_terminal_guard_lets_other_runs_through(env):
+    _, ctx, repo = env
+    other = start(ctx)["run_id"]          # waits on the agent's 'change' step
+    human = start(ctx)["run_id"]          # this session now follows this one
+    (repo / "calc.py").write_text("def add(a, b):\n    return a + b\n")
+    call(ctx, "sop_submit", {"outputs": {"summary": "fixed"}})  # human run now waits on approve
+    guard = ctx.hooks["pre_tool_call"]
+    for cmd in (f"opensop submit --output summary=done {other} change",
+                "id=x; opensop submit $id change --output summary=done"):
+        assert guard(tool_name="terminal", args={"command": cmd}, session_id="s1") is None, cmd
+    assert guard(tool_name="terminal", args={"command": f"opensop submit {human} approve --output decision=approve"},
+                 session_id="s1")["action"] == "block"
+
+
+def test_run_from_another_directory_says_how(env, tmp_path, monkeypatch):
+    _, ctx, _ = env
+    run_id = start(ctx)["run_id"]
+    other = tmp_path / "elsewhere"
+    other.mkdir()
+    (other / ".opensop").mkdir()  # a different OpenSOP cell keeps its own runs
+    monkeypatch.delenv("OPENSOP_LOCAL_HOME")
+    v = call(ctx, "sop_status", {"run_id": run_id, "workdir": str(other)}, session="s9")
+    assert "workdir" in v["error"], v

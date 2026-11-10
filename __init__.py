@@ -126,6 +126,9 @@ def _after(run_id, cwd, session_id):
     """Status after an action; bind this session to the run while it is open."""
     st, err = _status(run_id, cwd)
     if err:
+        if "no such local run" in err:
+            err += (f" Runs are stored per project (OpenSOP cell); this looked in {cwd}. "
+                    "Pass workdir= the directory the run was started from.")
         return tool_error(err, run_id=run_id)
     if st.get("state") in ("waiting", "failed", "running"):
         _bind(session_id, run_id, cwd)
@@ -209,7 +212,8 @@ TOOLS = [
     (sop_status, {
         "name": "sop_status",
         "description": "Show an OpenSOP run: its state, the step it waits on, or why it failed. "
-                       "Give a run_id to pick up a run started anywhere else (another agent, a person, a crashed session).",
+                       "Give a run_id to pick up a run started anywhere else (another agent, a person, a crashed session); "
+                       "pass workdir if it was started in another project directory.",
         "parameters": {"type": "object", "properties": {
             "run_id": _RUN_ID, "workdir": _WORKDIR,
             "detach": {"type": "boolean", "description": "Stop following this run in this session "
@@ -269,7 +273,25 @@ def _pre_verify(session_id=None, attempt=0, **kwargs):
     return None
 
 
-_SUBMIT = re.compile(r"\bopensop\b(?:\s+--?\S+)*\s+submit\s+(\S+)")
+_SUBMIT = re.compile(r"\bopensop\b(?:\s+--?\S+)*\s+submit\b([^;&|\n]*)")
+_VALUE_FLAGS = {"--output", "--outputs", "--outputs-file", "--decided-by", "--server"}
+
+
+def _submit_target(rest):
+    """(run_id, step) from the words after `opensop submit`, skipping flags and their values."""
+    try:
+        words = shlex.split(rest)
+    except ValueError:
+        words = rest.split()
+    pos, skip = [], False
+    for w in words:
+        if skip:
+            skip = False
+        elif w.startswith("-"):
+            skip = w in _VALUE_FLAGS
+        else:
+            pos.append(w)
+    return (pos + ["", ""])[:2]
 
 
 def _pre_tool_call(tool_name=None, args=None, session_id=None, **kwargs):
@@ -279,21 +301,23 @@ def _pre_tool_call(tool_name=None, args=None, session_id=None, **kwargs):
     m = _SUBMIT.search(str(args.get("command") or ""))
     if not m:
         return None
-    try:
-        run_id = shlex.split(m.group(1))[0]
-    except ValueError:
-        run_id = m.group(1).strip("'\"")
-    st, err = (None, "unusable") if run_id.startswith(("$", "-")) else _status(run_id, args.get("workdir") or _workdir({}))
-    if err:  # `opensop submit $id ...` or flags first: judge by the session's own run
+    run_id, step = _submit_target(m.group(1))
+    if run_id.startswith("$"):
+        # `opensop submit $id <step>`: the run can't be known here. Judge it by the
+        # session's own run only when the step named is that run's human step.
         bound = _bound(session_id) or {}
         if not bound.get("run_id"):
-            return None  # fail open: the CLI reports its own errors
-        run_id = bound["run_id"]
-        st, err = _status(run_id, bound.get("cwd"))
-        if err:
             return None
+        run_id, cwd = bound["run_id"], bound.get("cwd")
+    else:
+        cwd = args.get("workdir") or _workdir({})
+    if not run_id:
+        return None
+    st, err = _status(run_id, cwd)
+    if err:
+        return None  # fail open: the CLI reports its own errors
     w = st.get("waiting") or {}
-    if w.get("reason") in HUMAN_REASONS:
+    if w.get("reason") in HUMAN_REASONS and (not step or step.startswith("$") or step == w.get("step")):
         return {"action": "block",
                 "message": f"OpenSOP: step '{w.get('step')}' of run {run_id} is decided by a person. "
                            "Ask the user to submit it."}
