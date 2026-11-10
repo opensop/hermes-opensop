@@ -4,7 +4,7 @@
 
 Every process sits somewhere between a script and a judgment call. Some steps must always come out the same: run the tests, check the diff, merge only when the build is green. Others need a model: plan the work, write the change, decide what a failure means.
 
-[OpenSOP](https://github.com/opensop/opensop) lets you set that dial step by step, in one file. Scripts handle the steps that must be certain, and the agent handles the steps that need thinking. This plugin makes Hermes the worker on that line:
+[OpenSOP](https://github.com/opensop/opensop) lets you set that dial step by step, in one file. Scripts handle the steps that must be certain, and the agent handles the steps that need thinking. This plugin makes Hermes the worker on that line, and adds three things a prompt or a skill can't: Hermes is re-anchored on its step every turn, can't finish while its step is open, and can't approve its own change.
 
 - **Scripts decide done.** The agent submits its step; the next script step checks the work. If the tests fail, the run fails at that step, with the real reason, until the agent fixes it.
 - **Hermes doesn't have to remember anything.** The process lives in the file and the run lives in a folder on disk, not in the conversation. Compaction, a crash or a new session loses nothing.
@@ -61,16 +61,16 @@ A process is a JSON or YAML file. Each step is a script (`automated`), work for 
 
 ## Security and disclosure
 
-- **Shell commands.** Every tool runs the `opensop` CLI as a subprocess, in the session's working directory. OpenSOP runs a process file's script steps as shell commands on your machine, with your permissions. Only run process files you trust, as you would any script.
+- **Shell commands and agent CLIs.** Every tool runs the `opensop` CLI as a child process, in the session's working directory. A process file's script steps run as shell commands on your machine, with your permissions. Its `llm` and `judgment` steps can drive other coding-agent CLIs non-interactively (`claude`, `codex`, `cursor-agent`, `kimi`) with the permission the file declares, up to full access. Only run process files you trust, as you would any script.
 - **Files.** OpenSOP writes run folders under `$OPENSOP_LOCAL_HOME`, the nearest `.opensop/` cell, or `~/.opensop-local`. The plugin keeps a small session-to-run map in its Hermes plugin data.
 - **Network.** The plugin makes no network calls. A process file's own steps can (for example `webhook` or `llm` steps); that is up to the file.
 - **Credentials.** The plugin reads none. A process that calls a model uses that provider's own CLI login or API key.
-- **Approvals.** The plugin never auto-approves anything, never changes Hermes's approval settings, and never starts Hermes or shell children in non-interactive mode. It blocks the agent from deciding human steps; it does not decide them itself.
+- **Approvals.** The plugin never auto-approves anything, never changes Hermes's approval settings, and never starts Hermes itself. It blocks the agent from deciding human steps; it does not decide them itself.
 - **Long-running work.** A tool call lasts as long as the script steps it triggers, up to `OPENSOP_HERMES_TIMEOUT` seconds (default 1800). Nothing runs in the background.
 
 ## Limitations
 
-- The re-anchoring and finish gate follow one run per session. Start a second run and the session follows that one.
+- The re-anchoring and finish gate follow one run per session. Start a second run and the session follows that one. While a run waits on a person, the session keeps showing it; `sop_status` with `detach: true` stops following it.
 - The finish gate fires only on turns where Hermes edited code (that is when Hermes runs `pre_verify`).
 - The terminal guard recognises `opensop submit <run_id> …`. It is a seat belt for an honest agent, not a sandbox.
 

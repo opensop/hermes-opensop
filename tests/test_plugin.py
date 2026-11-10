@@ -134,3 +134,48 @@ def test_no_open_run(env):
     _, ctx, _ = env
     assert "no open run" in call(ctx, "sop_status", {})["error"]
     assert ctx.hooks["pre_verify"](session_id="s1", attempt=0) is None
+
+
+def test_cli_errors_reach_the_agent_and_keep_the_binding(env):
+    _, ctx, _ = env
+    v = call(ctx, "sop_run", {"process": str(EXAMPLE), "inputs": {}})  # required inputs missing
+    assert "error" in v and "request" in v["error"], v
+    run_id = start(ctx)["run_id"]
+    v = call(ctx, "sop_status", {"run_id": "nope"})
+    assert "nope" in v["error"], v
+    v = call(ctx, "sop_retry", {"run_id": "nope"})
+    assert "error" in v
+    assert run_id in ctx.hooks["pre_llm_call"](session_id="s1")["context"]  # still bound
+
+
+def test_submit_on_a_failed_run_says_retry(env):
+    _, ctx, _ = env
+    start(ctx)
+    call(ctx, "sop_submit", {"outputs": {"summary": "x"}})  # tests fail
+    v = call(ctx, "sop_submit", {"outputs": {"summary": "x"}})
+    assert "not waiting" in v["error"] and "sop_retry" in v["error"], v
+
+
+def test_checking_another_run_keeps_the_binding(env):
+    _, ctx, repo = env
+    old = start(ctx)["run_id"]
+    subprocess.run(["opensop", "cancel", old, "--json"], cwd=repo, capture_output=True, check=True)
+    current = start(ctx)["run_id"]
+    call(ctx, "sop_status", {"run_id": old})
+    assert current in ctx.hooks["pre_llm_call"](session_id="s1")["context"]
+    v = call(ctx, "sop_status", {"run_id": current, "detach": True})
+    assert v["detached"] and ctx.hooks["pre_llm_call"](session_id="s1") is None
+
+
+def test_terminal_guard_handles_quoting_variables_and_flags(env):
+    _, ctx, repo = env
+    run_id = start(ctx)["run_id"]
+    guard = ctx.hooks["pre_tool_call"]
+    assert guard(tool_name="terminal", args={"command": 'opensop submit "$(cat id.txt' }, session_id="s1") is None
+    (repo / "calc.py").write_text("def add(a, b):\n    return a + b\n")
+    call(ctx, "sop_submit", {"outputs": {"summary": "fixed"}})  # now waiting on approve
+    for cmd in ("id=x; opensop submit $id approve --output decision=approve",
+                f"opensop submit --output decision=approve {run_id} approve",
+                f'opensop submit "{run_id}" approve --output decision=approve'):
+        r = guard(tool_name="terminal", args={"command": cmd}, session_id="s1")
+        assert r and r["action"] == "block", cmd

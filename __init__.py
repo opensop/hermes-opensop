@@ -16,7 +16,10 @@ from tools.registry import tool_error, tool_result
 
 TOOLSET = "opensop"
 CLI_TIMEOUT_S = int(os.environ.get("OPENSOP_HERMES_TIMEOUT", "1800"))
+STATUS_TIMEOUT_S = 20  # hooks call status every turn; a wedged CLI must not stall the turn
 HUMAN_REASONS = {"waiting_for_approval", "escalated"}
+# Waits the agent can't act on: a person's decision, or an outside callback.
+NOT_AGENT_WORK = HUMAN_REASONS | {"waiting_for_callback"}
 MAX_CONTEXT_CHARS = 1500
 
 _state = None  # PluginState, set in register()
@@ -25,29 +28,38 @@ _ctx = None
 
 # ── opensop CLI ──────────────────────────────────────────────────────────────
 
-def _opensop(args, cwd):
+def _opensop(args, cwd, timeout=CLI_TIMEOUT_S):
     """Run `opensop <args> --json` in cwd. Returns (dict, error-string)."""
     exe = shutil.which("opensop")
     if not exe:
         return None, "opensop is not on PATH. Install it: https://github.com/opensop/opensop#install"
     try:
         p = subprocess.run([exe, *args, "--json"], cwd=cwd, capture_output=True, text=True,
-                           timeout=CLI_TIMEOUT_S, stdin=subprocess.DEVNULL)
+                           timeout=timeout, stdin=subprocess.DEVNULL)
     except subprocess.TimeoutExpired:
-        return None, f"opensop {args[0]} timed out after {CLI_TIMEOUT_S}s"
+        return None, f"opensop {args[0]} timed out after {timeout}s"
     except OSError as e:
         return None, f"opensop could not start: {e}"
     try:
-        out = json.loads(p.stdout or "{}")
+        out = json.loads(p.stdout or "null")
     except ValueError:
-        return None, (p.stderr or p.stdout or f"opensop exited {p.returncode}").strip()[-2000:]
-    if p.returncode != 0 and isinstance(out, dict) and out.get("error") and not out.get("run_id"):
-        return None, out.get("message") or out["error"]
-    return out, None
+        out = None
+    if isinstance(out, dict) and (p.returncode == 0 or out.get("run_id")):
+        return out, None  # a run that ended failed still exits non-zero; its state is in status
+    # Errors come as JSON on stderr ({error, message}), sometimes after plain notes.
+    for line in reversed((p.stderr or "").strip().splitlines()):
+        try:
+            e = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(e, dict) and e.get("error"):
+            return None, e.get("message") or e["error"]
+    text = (p.stderr or p.stdout or "").strip()
+    return None, (text or f"opensop {args[0]} exited {p.returncode} with no output")[-2000:]
 
 
 def _status(run_id, cwd):
-    return _opensop(["status", run_id], cwd)
+    return _opensop(["status", run_id], cwd, timeout=STATUS_TIMEOUT_S)
 
 
 def _view(st):
@@ -116,8 +128,8 @@ def _after(run_id, cwd, session_id):
         return tool_error(err, run_id=run_id)
     if st.get("state") in ("waiting", "failed", "running"):
         _bind(session_id, run_id, cwd)
-    else:
-        _unbind(session_id)
+    elif (_bound(session_id) or {}).get("run_id") == run_id:
+        _unbind(session_id)  # only this run's own end releases the session
     return tool_result(_view(st))
 
 
@@ -132,6 +144,8 @@ def sop_run(args, **kwargs):
     out, err = _opensop(cli, cwd)
     if err:
         return tool_error(err)
+    if not out.get("run_id"):
+        return tool_error("opensop run did not start a run", output=json.dumps(out)[:500])
     return _after(out["run_id"], cwd, kwargs.get("session_id"))
 
 
@@ -139,6 +153,11 @@ def sop_status(args, **kwargs):
     run_id, cwd = _resolve(args, kwargs)
     if not run_id:
         return tool_error("no run_id given and this session has no open run")
+    if args.get("detach"):
+        if (_bound(kwargs.get("session_id")) or {}).get("run_id") == run_id:
+            _unbind(kwargs.get("session_id"))
+        return tool_result(run_id=run_id, detached=True,
+                           note="This session no longer follows the run. The run itself is unchanged.")
     return _after(run_id, cwd, kwargs.get("session_id"))
 
 
@@ -151,6 +170,9 @@ def sop_submit(args, **kwargs):
         return tool_error(err, run_id=run_id)
     w = st.get("waiting") or {}
     step = args.get("step") or w.get("step")
+    if not w or not step:
+        hint = " It failed: fix the cause, then call sop_retry." if st.get("state") == "failed" else ""
+        return tool_error(f"Run {run_id} is {st.get('state')}, not waiting on a step.{hint}", run_id=run_id)
     if w.get("reason") in HUMAN_REASONS:
         return tool_error(f"Step '{w.get('step')}' is decided by a person, not the agent. "
                           "Ask the user to run: opensop submit " + run_id + " " + str(w.get("step")) +
@@ -187,7 +209,10 @@ TOOLS = [
         "name": "sop_status",
         "description": "Show an OpenSOP run: its state, the step it waits on, or why it failed. "
                        "Give a run_id to pick up a run started anywhere else (another agent, a person, a crashed session).",
-        "parameters": {"type": "object", "properties": {"run_id": _RUN_ID, "workdir": _WORKDIR}}}),
+        "parameters": {"type": "object", "properties": {
+            "run_id": _RUN_ID, "workdir": _WORKDIR,
+            "detach": {"type": "boolean", "description": "Stop following this run in this session "
+                       "(for example, while it waits on a person). The run is unchanged."}}}}),
     (sop_submit, {
         "name": "sop_submit",
         "description": "Finish the step the run waits on by giving its outputs. The run then continues; its "
@@ -222,6 +247,8 @@ def _pre_llm_call(session_id=None, **kwargs):
     v = _open_view(session_id)
     if not v:
         return None
+    if v.get("error"):
+        v["error"] = {**v["error"], "message": str(v["error"].get("message") or "")[-600:]}
     text = ("[OpenSOP] This session is working on run " + str(v["run_id"]) + " (" + str(v["process"]) +
             "), state " + str(v["state"]) + ". " + json.dumps({k: v[k] for k in ("waiting", "error", "next") if k in v}))
     return {"context": text[:MAX_CONTEXT_CHARS]}
@@ -234,7 +261,7 @@ def _pre_verify(session_id=None, attempt=0, **kwargs):
     v = _open_view(session_id)
     if not v:
         return None
-    if v.get("error") or (v.get("waiting") or {}).get("reason") not in HUMAN_REASONS | {None}:
+    if v.get("error") or (v.get("waiting") or {}).get("reason") not in NOT_AGENT_WORK | {None}:
         return {"action": "continue",
                 "message": f"OpenSOP run {v['run_id']} is still open: {v['next']} "
                            "The run's scripts decide when it is done, so finish the step or explain what blocks it."}
@@ -244,17 +271,26 @@ def _pre_verify(session_id=None, attempt=0, **kwargs):
 _SUBMIT = re.compile(r"\bopensop\b(?:\s+--?\S+)*\s+submit\s+(\S+)")
 
 
-def _pre_tool_call(tool_name=None, args=None, **kwargs):
+def _pre_tool_call(tool_name=None, args=None, session_id=None, **kwargs):
     """Refuse a terminal `opensop submit` on a step reserved for a person."""
     if tool_name != "terminal" or not isinstance(args, dict):
         return None
     m = _SUBMIT.search(str(args.get("command") or ""))
     if not m:
         return None
-    run_id = shlex.split(m.group(1))[0] if m.group(1) else ""
-    st, err = _status(run_id, args.get("workdir") or _workdir({}))
-    if err:
-        return None  # fail open: the CLI reports its own errors
+    try:
+        run_id = shlex.split(m.group(1))[0]
+    except ValueError:
+        run_id = m.group(1).strip("'\"")
+    st, err = (None, "unusable") if run_id.startswith(("$", "-")) else _status(run_id, args.get("workdir") or _workdir({}))
+    if err:  # `opensop submit $id ...` or flags first: judge by the session's own run
+        bound = _bound(session_id) or {}
+        if not bound.get("run_id"):
+            return None  # fail open: the CLI reports its own errors
+        run_id = bound["run_id"]
+        st, err = _status(run_id, bound.get("cwd"))
+        if err:
+            return None
     w = st.get("waiting") or {}
     if w.get("reason") in HUMAN_REASONS:
         return {"action": "block",
