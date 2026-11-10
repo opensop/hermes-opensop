@@ -214,3 +214,77 @@ def test_run_from_another_directory_says_how(env, tmp_path, monkeypatch):
     monkeypatch.delenv("OPENSOP_LOCAL_HOME")
     v = call(ctx, "sop_status", {"run_id": run_id, "workdir": str(other)}, session="s9")
     assert "workdir" in v["error"], v
+
+
+def test_agent_submissions_are_recorded_as_the_agent(env, tmp_path):
+    _, ctx, _ = env
+    v = start(ctx)
+    big = "x" * 200_000  # run-sized values go through a file, not argv
+    call(ctx, "sop_submit", {"outputs": {"summary": big}})
+    audit = Path(v["run_dir"]) / "audit.jsonl"
+    rec = [json.loads(line) for line in audit.read_text().splitlines() if '"change"' in line][-1]
+    assert rec["status"] == "completed" and rec.get("decided_by") == "agent:hermes", rec
+
+
+def test_seat_belts_around_the_run_folder(env):
+    _, ctx, repo = env
+    v = start(ctx)
+    guard = ctx.hooks["pre_tool_call"]
+    assert guard(tool_name="sop_run", args={"process": "x.sop.json"}, session_id="s1")["action"] == "approve"
+    for name, args in (("terminal", {"command": "sed -i s/a/b/ .opensop-local/runs/*/manifest.json"}),
+                       ("terminal", {"command": f"cat {v['run_dir']}/context.json"}),
+                       ("write_file", {"path": f"{v['run_dir']}/manifest.json", "content": "{}"})):
+        assert guard(tool_name=name, args=args, session_id="s1")["action"] == "block", args
+    assert guard(tool_name="write_file", args={"path": "public/manifest.json", "content": "{}"}, session_id="s1") is None
+    assert guard(tool_name="terminal", args={"command": "npm test"}, session_id="s1") is None
+    (repo / "calc.py").write_text("def add(a, b):\n    return a + b\n")
+    call(ctx, "sop_submit", {"outputs": {"summary": "fixed"}})  # waits on approve
+    cmd = f'"opensop" submit {v["run_id"]} approve --output decision=approve'
+    assert guard(tool_name="terminal", args={"command": cmd}, session_id="s1")["action"] == "block"
+
+
+def test_callback_steps_are_not_agent_work(env, tmp_path):
+    _, ctx, _ = env
+    proc = tmp_path / "cb.sop.json"
+    proc.write_text(json.dumps({"opensop": "0.9.1", "name": "cb", "version": "1", "steps": [
+        {"id": "hook", "type": "wait", "wait": {"until": "2099-01-01T00:00:00Z"}}]}))
+    v = call(ctx, "sop_run", {"process": str(proc)})
+    assert v["waiting"]["reason"] == "waiting_for_callback" and "Nothing to do" in v["next"], v
+    assert "outside callback" in call(ctx, "sop_submit", {"outputs": {}})["error"]
+
+
+def test_timeout_stops_the_step_and_its_children(env, tmp_path, monkeypatch):
+    mod, ctx, _ = env
+    marker = tmp_path / "marker"
+    proc = tmp_path / "slow.sop.json"
+    proc.write_text(json.dumps({"opensop": "0.9.1", "name": "slow", "version": "1", "steps": [
+        {"id": "s", "type": "shell", "run": f"sleep 4; touch {marker}"}]}))
+    monkeypatch.setattr(mod, "CLI_TIMEOUT_S", 1)
+    v = json.loads(ctx.tools["sop_run"]({"process": str(proc)}, session_id="t"))
+    assert "timed out" in v["error"], v
+    import time
+    time.sleep(5)
+    assert not marker.exists()
+
+
+def test_old_cli_is_refused_with_the_fix(env, tmp_path, monkeypatch):
+    mod, ctx, _ = env
+    fake = tmp_path / "bin"
+    fake.mkdir()
+    (fake / "opensop").write_text("#!/bin/sh\necho 'opensop 0.9.1'\n")
+    (fake / "opensop").chmod(0o755)
+    monkeypatch.setenv("PATH", f"{fake}:{os.environ['PATH']}")
+    monkeypatch.setattr(mod, "_cli_checked", None)
+    v = call(ctx, "sop_run", {"process": str(EXAMPLE)})
+    assert "too old" in v["error"] and "opensop upgrade" in v["error"], v
+
+
+def test_a_rejected_change_fails_the_run(env):
+    _, ctx, repo = env
+    run_id = start(ctx)["run_id"]
+    (repo / "calc.py").write_text("def add(a, b):\n    return a + b\n")
+    call(ctx, "sop_submit", {"outputs": {"summary": "fixed"}})
+    subprocess.run(["opensop", "submit", run_id, "approve", "--output", "decision=reject", "--json"],
+                   cwd=repo, capture_output=True)
+    v = call(ctx, "sop_status", {"run_id": run_id})
+    assert v["state"] == "failed" and "not approved" in v["error"]["message"], v

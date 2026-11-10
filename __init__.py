@@ -1,9 +1,10 @@
 """OpenSOP for Hermes: run a process file, step by step, with receipts.
 
 The run lives in OpenSOP's run folder, not in this session. The plugin binds a
-Hermes session to a run, shows the agent the current step every turn, keeps
-the agent going while its step is open, and refuses to let the agent decide a
-step that is reserved for a human. Everything else is the `opensop` CLI.
+Hermes session to a run, shows the agent the current step every turn, nudges
+the agent to finish its open step, and refuses agent submissions of steps
+reserved for a person (a seat belt, not a sandbox). Everything else is the
+`opensop` CLI.
 """
 import hashlib
 import json
@@ -11,7 +12,9 @@ import os
 import re
 import shlex
 import shutil
+import signal
 import subprocess
+import tempfile
 
 from tools.registry import tool_error, tool_result
 
@@ -21,26 +24,65 @@ STATUS_TIMEOUT_S = 20  # hooks call status every turn; a wedged CLI must not sta
 HUMAN_REASONS = {"waiting_for_approval", "escalated"}
 # Waits the agent can't act on: a person's decision, or an outside callback.
 NOT_AGENT_WORK = HUMAN_REASONS | {"waiting_for_callback"}
+OPEN_STATES = ("waiting", "failed", "running", "interrupted")
 MAX_CONTEXT_CHARS = 1500
+MIN_CLI = (0, 10, 0)
+DECIDED_BY = "agent:hermes"
+INSTALL_URL = "https://github.com/opensop/opensop#quickstart-60-seconds"
+# Run-folder files an agent never needs to touch while it works a run.
+RUN_FILES = ("manifest.json", "audit.jsonl", "context.json", "process.snapshot.json", "fault.json")
 
 _state = None  # PluginState, set in register()
 _ctx = None
+_cli_checked = None  # (exe, error) once the CLI version has been checked
 
 
 # ── opensop CLI ──────────────────────────────────────────────────────────────
 
-def _opensop(args, cwd, timeout=CLI_TIMEOUT_S):
-    """Run `opensop <args> --json` in cwd. Returns (dict, error-string)."""
+def _cli():
+    """(path to opensop, error). Checks once that it is on PATH and new enough."""
+    global _cli_checked
     exe = shutil.which("opensop")
+    if _cli_checked and _cli_checked[0] == exe:
+        return _cli_checked
     if not exe:
-        return None, "opensop is not on PATH. Install it: https://github.com/opensop/opensop#install"
+        return None, f"opensop is not on PATH. Install it: {INSTALL_URL}"
     try:
-        p = subprocess.run([exe, *args, "--json"], cwd=cwd, capture_output=True, text=True,
-                           timeout=timeout, stdin=subprocess.DEVNULL)
-    except subprocess.TimeoutExpired:
-        return None, f"opensop {args[0]} timed out after {timeout}s"
+        first = subprocess.run([exe, "--version"], capture_output=True, text=True, timeout=10).stdout.split("\n")[0]
+        have = tuple(int(x) for x in re.search(r"(\d+)\.(\d+)\.(\d+)", first).groups())
+    except Exception:
+        have = (0, 0, 0)
+    err = None if have >= MIN_CLI else (
+        f"opensop {'.'.join(map(str, have))} is too old; this plugin needs "
+        f"{'.'.join(map(str, MIN_CLI))} or later. Run: opensop upgrade")
+    _cli_checked = (exe, err)
+    return _cli_checked
+
+
+def _opensop(args, cwd, timeout=None):
+    """Run `opensop <args> --json` in cwd. Returns (dict, error-string)."""
+    timeout = timeout or CLI_TIMEOUT_S
+    exe, err = _cli()
+    if err:
+        return None, err
+    try:
+        # Own process group, so a timeout stops the step's children too.
+        proc = subprocess.Popen([exe, *args, "--json"], cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                stdin=subprocess.DEVNULL, text=True, errors="replace", start_new_session=True)
     except OSError as e:
         return None, f"opensop could not start: {e}"
+    try:
+        stdout, stderr = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(proc.pid, signal.SIGTERM)
+            proc.communicate(timeout=10)
+        except (OSError, subprocess.TimeoutExpired):
+            os.killpg(proc.pid, signal.SIGKILL)
+            proc.communicate()
+        return None, (f"opensop {args[0]} timed out after {timeout}s and was stopped; the step in progress "
+                      "is marked interrupted. Find the run with sop_status or `opensop runs`, then sop_retry.")
+    p = subprocess.CompletedProcess(proc.args, proc.returncode, stdout, stderr)
     try:
         out = json.loads(p.stdout or "null")
     except ValueError:
@@ -72,11 +114,15 @@ def _view(st):
         v["waiting"] = {k: w.get(k) for k in ("step", "reason", "description", "expects") if w.get(k)}
         if w.get("reason") in HUMAN_REASONS:
             v["next"] = f"A person decides this step: opensop submit {v['run_id']} {w.get('step')} --output decision=..."
+        elif w.get("reason") == "waiting_for_callback":
+            v["next"] = "The run waits on an outside callback or timer. Nothing to do until it arrives."
         else:
             v["next"] = "Do the work for this step, then call sop_submit with its outputs."
     if st.get("error"):
         v["error"] = st["error"]
         v["next"] = "Fix the cause, then call sop_retry to re-run the failed step."
+    elif st.get("state") == "interrupted":
+        v["next"] = "The run stopped mid-step. Call sop_retry to re-run that step."
     return v
 
 
@@ -86,9 +132,9 @@ def _key(session_id):
     return "bind:" + hashlib.sha256(str(session_id).encode()).hexdigest()
 
 
-def _bind(session_id, run_id, cwd):
+def _bind(session_id, run_id, cwd, run_dir=None):
     if _state is not None and session_id:
-        _state.set(_key(session_id), {"run_id": run_id, "cwd": cwd})
+        _state.set(_key(session_id), {"run_id": run_id, "cwd": cwd, "run_dir": run_dir})
 
 
 def _bound(session_id):
@@ -130,8 +176,8 @@ def _after(run_id, cwd, session_id):
             err += (f" Runs are stored per project (OpenSOP cell); this looked in {cwd}. "
                     "Pass workdir= the directory the run was started from.")
         return tool_error(err, run_id=run_id)
-    if st.get("state") in ("waiting", "failed", "running"):
-        _bind(session_id, run_id, cwd)
+    if st.get("state") in OPEN_STATES:
+        _bind(session_id, run_id, cwd, st.get("run_dir"))
     elif (_bound(session_id) or {}).get("run_id") == run_id:
         _unbind(session_id)  # only this run's own end releases the session
     return tool_result(_view(st))
@@ -144,8 +190,8 @@ def sop_run(args, **kwargs):
     if not process:
         return tool_error("process is required: a path to a .sop.json/.sop.yaml file or a process name")
     cwd = _workdir(args)
-    cli = ["run", process, "--inputs", json.dumps(args.get("inputs") or {})]
-    out, err = _opensop(cli, cwd)
+    with _json_file(args.get("inputs") or {}) as path:
+        out, err = _opensop(["run", process, "--inputs-file", path], cwd)
     if err:
         return tool_error(err)
     if not out.get("run_id"):
@@ -181,7 +227,11 @@ def sop_submit(args, **kwargs):
         return tool_error(f"Step '{w.get('step')}' is decided by a person, not the agent. "
                           "Ask the user to run: opensop submit " + run_id + " " + str(w.get("step")) +
                           " --output decision=...", run_id=run_id)
-    _, err = _opensop(["submit", run_id, step, "--outputs", json.dumps(args.get("outputs") or {})], cwd)
+    if w.get("reason") == "waiting_for_callback":
+        return tool_error(f"Step '{w.get('step')}' waits on an outside callback or timer, not on the agent.",
+                          run_id=run_id)
+    with _json_file(args.get("outputs") or {}) as path:
+        _, err = _opensop(["submit", run_id, step, "--outputs-file", path, "--decided-by", DECIDED_BY], cwd)
     if err:
         return tool_error(err, run_id=run_id)
     return _after(run_id, cwd, kwargs.get("session_id"))
@@ -195,6 +245,21 @@ def sop_retry(args, **kwargs):
     if err:
         return tool_error(err, run_id=run_id)
     return _after(run_id, cwd, kwargs.get("session_id"))
+
+
+class _json_file:
+    """A temp JSON file for --inputs-file/--outputs-file: run-sized values don't fit in argv."""
+    def __init__(self, value):
+        self.value = value
+
+    def __enter__(self):
+        fd, self.path = tempfile.mkstemp(prefix="opensop-hermes-", suffix=".json")
+        with os.fdopen(fd, "w") as f:
+            json.dump(self.value, f)
+        return self.path
+
+    def __exit__(self, *exc):
+        os.unlink(self.path)
 
 
 _RUN_ID = {"type": "string", "description": "Run id. Defaults to this session's open run."}
@@ -229,7 +294,8 @@ TOOLS = [
             "workdir": _WORKDIR}, "required": ["outputs"]}}),
     (sop_retry, {
         "name": "sop_retry",
-        "description": "Re-run the failed step of an OpenSOP run after you fixed the cause, and continue the run.",
+        "description": "Re-run the failed or interrupted step of an OpenSOP run after you fixed the cause, "
+                       "and continue the run.",
         "parameters": {"type": "object", "properties": {"run_id": _RUN_ID, "workdir": _WORKDIR}}}),
 ]
 
@@ -241,7 +307,7 @@ def _open_view(session_id):
     if not b or not b.get("run_id"):
         return None
     st, err = _status(b["run_id"], b.get("cwd"))
-    if err or st.get("state") not in ("waiting", "failed", "running"):
+    if err or st.get("state") not in OPEN_STATES:
         _unbind(session_id)
         return None
     return _view(st)
@@ -273,7 +339,7 @@ def _pre_verify(session_id=None, attempt=0, **kwargs):
     return None
 
 
-_SUBMIT = re.compile(r"\bopensop\b(?:\s+--?\S+)*\s+submit\b([^;&|\n]*)")
+_SUBMIT = re.compile(r"\bopensop\b['\"]?(?:\s+--?\S+)*\s+submit\b([^;&|\n]*)")
 _VALUE_FLAGS = {"--output", "--outputs", "--outputs-file", "--decided-by", "--server"}
 
 
@@ -294,18 +360,37 @@ def _submit_target(rest):
     return (pos + ["", ""])[:2]
 
 
+def _block(msg):
+    return {"action": "block", "message": "OpenSOP: " + msg}
+
+
 def _pre_tool_call(tool_name=None, args=None, session_id=None, **kwargs):
-    """Refuse a terminal `opensop submit` on a step reserved for a person."""
-    if tool_name != "terminal" or not isinstance(args, dict):
+    """Seat belts around a run. Not a sandbox: an agent with a shell can still get around them."""
+    if not isinstance(args, dict):
         return None
-    m = _SUBMIT.search(str(args.get("command") or ""))
+    if tool_name == "sop_run":
+        # Script steps run as shell commands outside Hermes's terminal approvals: ask once per run.
+        # The process definition is pinned when the run starts.
+        return {"action": "approve",
+                "message": f"OpenSOP will run the script steps of {args.get('process')} in "
+                           f"{_workdir(args)} with your permissions."}
+    if tool_name in TOOL_NAMES:
+        return None
+    bound = _bound(session_id) or {}
+    text = json.dumps(args)
+    # The run folder is the record. Nothing the agent does should rewrite it.
+    in_runs = "runs/" in text or ".opensop" in text or ".opensop-local" in text
+    if bound.get("run_dir") and (bound["run_dir"] in text or (in_runs and any(f in text for f in RUN_FILES))):
+        return _block(f"run {bound['run_id']}'s run folder is its record; the agent doesn't edit it. "
+                      "Use the sop_* tools.")
+    command = str(args.get("command") or "") if tool_name == "terminal" else ""
+    m = _SUBMIT.search(command)
     if not m:
         return None
     run_id, step = _submit_target(m.group(1))
-    if run_id.startswith("$"):
-        # `opensop submit $id <step>`: the run can't be known here. Judge it by the
-        # session's own run only when the step named is that run's human step.
-        bound = _bound(session_id) or {}
+    if run_id.startswith("$") or run_id == bound.get("run_id"):
+        # `opensop submit $id <step>`: judge by the session's own run only when the
+        # step named is that run's human step.
         if not bound.get("run_id"):
             return None
         run_id, cwd = bound["run_id"], bound.get("cwd")
@@ -318,17 +403,18 @@ def _pre_tool_call(tool_name=None, args=None, session_id=None, **kwargs):
         return None  # fail open: the CLI reports its own errors
     w = st.get("waiting") or {}
     if w.get("reason") in HUMAN_REASONS and (not step or step.startswith("$") or step == w.get("step")):
-        return {"action": "block",
-                "message": f"OpenSOP: step '{w.get('step')}' of run {run_id} is decided by a person. "
-                           "Ask the user to submit it."}
+        return _block(f"step '{w.get('step')}' of run {run_id} is decided by a person. Ask the user to submit it.")
     return None
 
 
 def _post_compaction(session_id=None, old_session_id=None, **kwargs):
     b = _bound(old_session_id)
     if b and session_id and session_id != old_session_id:
-        _bind(session_id, b["run_id"], b.get("cwd"))
+        _bind(session_id, b["run_id"], b.get("cwd"), b.get("run_dir"))
         _unbind(old_session_id)
+
+
+TOOL_NAMES = {schema["name"] for _, schema in TOOLS}
 
 
 def register(ctx):
