@@ -5,6 +5,7 @@ Hermes session to a run, shows the agent the current step every turn, keeps
 the agent going while its step is open, and refuses to let the agent decide a
 step that is reserved for a human. Everything else is the `opensop` CLI.
 """
+import hashlib
 import json
 import os
 import re
@@ -82,7 +83,7 @@ def _view(st):
 # ── session binding (session -> run) ─────────────────────────────────────────
 
 def _key(session_id):
-    return "bind:" + re.sub(r"[^A-Za-z0-9_.:-]", "_", str(session_id))[:120]
+    return "bind:" + hashlib.sha256(str(session_id).encode()).hexdigest()
 
 
 def _bind(session_id, run_id, cwd):
@@ -303,6 +304,7 @@ def _post_compaction(session_id=None, old_session_id=None, **kwargs):
     b = _bound(old_session_id)
     if b and session_id and session_id != old_session_id:
         _bind(session_id, b["run_id"], b.get("cwd"))
+        _unbind(old_session_id)
 
 
 def register(ctx):

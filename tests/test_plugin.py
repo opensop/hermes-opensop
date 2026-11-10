@@ -179,3 +179,13 @@ def test_terminal_guard_handles_quoting_variables_and_flags(env):
                 f'opensop submit "{run_id}" approve --output decision=approve'):
         r = guard(tool_name="terminal", args={"command": cmd}, session_id="s1")
         assert r and r["action"] == "block", cmd
+
+
+def test_session_keys_do_not_collide_and_compaction_moves_the_binding(env):
+    mod, ctx, _ = env
+    assert mod._key("a/b") != mod._key("a_b")
+    assert mod._key("x" * 121 + "A") != mod._key("x" * 121 + "B")
+    run_id = start(ctx)["run_id"]
+    ctx.hooks["post_compaction"](session_id="s1b", old_session_id="s1")
+    assert ctx.hooks["pre_llm_call"](session_id="s1") is None
+    assert run_id in ctx.hooks["pre_llm_call"](session_id="s1b")["context"]
