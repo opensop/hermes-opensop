@@ -18,7 +18,7 @@ Every process sits somewhere between a script and a judgment call. Some steps mu
 | `sop_run` | Start a run of a process file. Script steps run at once; the run stops at the first step that needs the agent or a person. |
 | `sop_status` | Where a run stands: the step it waits on, what that step expects, or why it failed. Give it any run id to pick up a run started elsewhere (with `workdir` if it was another project). |
 | `sop_submit` | Finish the step the run waits on. The run continues and its scripts check the work. |
-| `sop_retry` | After fixing a failure, re-run the failed or interrupted step and continue. |
+| `sop_retry` | After fixing a failure, re-run the failed or interrupted step and continue (the CLI's `opensop heal <run_id> --apply`). |
 | Re-anchoring (`pre_llm_call`) | Every turn, the agent sees which run it is on and the step it owes. This survives compaction (`post_compaction`). |
 | Finish gate (`pre_verify`) | On a turn where it edited code, the agent is nudged once to finish its open step, or say what blocks it, before wrapping up. |
 | Human steps stay human (`pre_tool_call`) | Approval steps and escalated judgments are for a person. `sop_submit` refuses them, an `opensop submit` for them in the terminal is blocked, and so are edits to the run's own folder. Everything the agent submits is recorded as `decided_by: agent:hermes`. |
@@ -32,7 +32,7 @@ Requirements: Hermes Agent 0.23.0 or later, and the `opensop` CLI 0.10.0 or late
 curl -fsSL https://raw.githubusercontent.com/opensop/opensop/main/cli/install.sh | bash
 export PATH="$HOME/.local/bin:$PATH"   # where the installer puts opensop; Hermes must see it on PATH
 hermes plugins install https://github.com/opensop/hermes-opensop
-hermes plugins enable opensop
+hermes plugins enable opensop          # shows what the plugin provides and asks you to confirm
 ```
 
 ## Try it
@@ -56,7 +56,10 @@ Then try the part a prompt can't do: quit Hermes mid-run, and finish from anywhe
 ```bash
 opensop status <run_id>          # where the run stands, and the exact next command
 opensop submit <run_id> approve --output decision=approve
+opensop heal <run_id> --apply     # after fixing a failed step: re-run it and continue
 ```
+
+Script steps always run in the project the run was started in, wherever you type these.
 
 Or start a fresh Hermes session in the same project and say "continue OpenSOP run `<run_id>`". Runs are stored per project, so from another directory, also give the project path.
 
